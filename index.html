@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>年金合同备案审核看板</title>
+    <link rel="stylesheet" href="css/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/docx@8.5.0/build/index.umd.js"></script>
+    <script>
+        window.jsErrors = [];
+        window.onerror = function(msg, url, line) {
+            window.jsErrors.push({msg: msg, url: url, line: line});
+            return false;
+        };
+        window.addEventListener('error', function(e) {
+            if (e.target && (e.target.tagName === 'SCRIPT' || e.target.tagName === 'LINK')) {
+                var src = e.target.src || e.target.href || '';
+                window.jsErrors.push({msg: '资源加载失败: ' + src, url: location.href, line: 0});
+            }
+        }, true);
+    </script>
+</head>
+<body>
+    <div id="toastContainer" class="toast-container"></div>
+    <div class="app">
+        <header class="app-header">
+            <div class="header-inner">
+                <div class="brand">
+                    <div class="logo">年金</div>
+                    <div class="title-group">
+                        <h1>年金合同备案审核看板</h1>
+                        <p>企业年金/职业年金基金管理合同备案 · 逐条审核</p>
+                    </div>
+                </div>
+                <div class="actions">
+                    <input type="file" id="folderInput" webkitdirectory directory multiple style="display:none">
+                    <input type="file" id="compareFileA" style="display:none">
+                    <input type="file" id="compareFileB" style="display:none">
+                    <button id="importBtn" class="btn btn-primary"><span class="btn-icon">📂</span>导入数据</button>
+                    <button id="reportBtn" class="btn btn-default"><span class="btn-icon">📄</span>生成报告</button>
+                    <button id="compareBtn" class="btn btn-default"><span class="btn-icon">🔄</span>版本比对</button>
+                    <button id="basisLibBtn" class="btn btn-default"><span class="btn-icon">📚</span>文件依据库</button>
+                    <button id="projectBtn" class="btn btn-default"><span class="btn-icon">📁</span>项目管理</button>
+                    <button id="historyBtn" class="btn btn-default"><span class="btn-icon">📜</span>历史记录</button>
+                    <button id="clearBtn" class="btn btn-default"><span class="btn-icon">🗑️</span>清除数据</button>
+                </div>
+            </div>
+        </header>
+
+        <main class="app-main" id="mainPanel">
+            <section class="empty-state" id="emptyState">
+                <div class="empty-icon">📁</div>
+                <h2>暂无审核数据</h2>
+                <p>选择合同备案材料文件夹，开始自动审核</p>
+                <button id="emptyImportBtn" class="btn btn-primary btn-lg">
+                    <span class="btn-icon">📂</span> 导入合同材料
+                </button>
+                <p class="hint">支持 .docx、.pdf、.txt 等材料文件</p>
+                <div id="historyInEmpty" class="history-in-empty" style="display:none;">
+                    <div class="history-divider"><span>📜 历史审核记录</span></div>
+                    <div id="historyListEmpty" class="history-list-compact"></div>
+                </div>
+            </section>
+
+            <section class="dashboard" id="dashboard" style="display:none;">
+                <div class="info-bar card">
+                    <span class="info-item"><strong id="planName">-</strong></span>
+                    <span class="info-item tag" id="recordType">-</span>
+                    <span class="info-item">受托人：<span id="trustee">-</span></span>
+                    <span class="info-item">材料 <span id="materialCount">0</span> 份</span>
+                    <span class="info-item">导入：<span id="importTime">-</span></span>
+                    <span class="info-item">来源：<span id="sourceDir">-</span></span>
+                </div>
+
+                <div class="keyinfo-card card" id="keyInfoCard" style="display:none;">
+                    <div class="keyinfo-title">关键信息提取 <span class="keyinfo-sub">自动识别，请人工核对</span></div>
+                    <div class="keyinfo-grid" id="keyInfoGrid"></div>
+                </div>
+
+                <div class="conclusion-row">
+                    <div class="conclusion-card card" id="conclusionCard">
+                        <div class="conclusion-label">建议结论</div>
+                        <div class="conclusion-value" id="conclusionText">-</div>
+                    </div>
+                    <div class="risk-summary" id="riskSummary">
+                        <span class="risk-dot level-a"></span>A 类 <span id="countA">0</span> 项
+                        <span class="risk-dot level-b"></span>B 类 <span id="countB">0</span> 项
+                        <span class="risk-dot level-c"></span>C 类 <span id="countC">0</span> 项
+                    </div>
+                </div>
+
+                <div class="stats-grid">
+                    <div class="stat-card card">
+                        <div class="stat-value" id="statFiles">0</div>
+                        <div class="stat-label">材料文件</div>
+                        <div class="stat-sub" id="statFilesSub">已解析 0 份 · 扫描件 0 份</div>
+                    </div>
+                    <div class="stat-card card">
+                        <div class="stat-value" id="statApplicable">0</div>
+                        <div class="stat-label">适用项</div>
+                        <div class="stat-sub" id="statPassRate">通过 0%</div>
+                    </div>
+                    <div class="stat-card card stat-level-a">
+                        <div class="stat-value" id="statA">0</div>
+                        <div class="stat-label">A 类 不予备案</div>
+                        <div class="stat-sub">硬性红线，先补正项</div>
+                    </div>
+                    <div class="stat-card card stat-level-b">
+                        <div class="stat-value" id="statB">0</div>
+                        <div class="stat-label">B 类 待补正</div>
+                        <div class="stat-sub">补正后可备案</div>
+                    </div>
+                    <div class="stat-card card stat-level-c">
+                        <div class="stat-value" id="statC">0</div>
+                        <div class="stat-label">C 类 提示改进</div>
+                        <div class="stat-sub">不影响备案结论</div>
+                    </div>
+                    <div class="stat-card card stat-confirm">
+                        <div class="stat-value" id="statConfirm">0</div>
+                        <div class="stat-label">需人工确认</div>
+                        <div class="stat-sub" id="statConfirmSub">另有待查 0 项</div>
+                    </div>
+                    <div class="stat-card card stat-fix">
+                        <div class="stat-value" id="statFixProgress">0%</div>
+                        <div class="stat-label">整改进度</div>
+                        <div class="stat-sub" id="statFixSub">已整改 0 / 待整改 0</div>
+                    </div>
+                </div>
+
+                <div class="charts-row">
+                    <div class="chart-card card">
+                        <div class="chart-title">结论分布 <span class="chart-sub" id="totalItems">共 0 项</span></div>
+                        <div id="pieChart" class="chart-box"></div>
+                    </div>
+                    <div class="chart-card card">
+                        <div class="chart-title">各组审核情况 <span class="chart-sub">条形长度 = 该组检查项数</span></div>
+                        <div id="barChart" class="chart-box"></div>
+                    </div>
+                </div>
+
+                <div class="result-section card">
+                    <div class="result-toolbar">
+                        <div class="tabs">
+                            <button class="tab active" data-filter="all">审核结果</button>
+                            <button class="tab" data-filter="material">材料清单</button>
+                        </div>
+                        <div class="filters">
+                            <button class="filter-btn active" data-status="all">全部 <span id="filterAll">0</span></button>
+                            <button class="filter-btn" data-status="fail">不通过 <span id="filterFail">0</span></button>
+                            <button class="filter-btn" data-status="rectify">待补正 <span id="filterRectify">0</span></button>
+                            <button class="filter-btn" data-status="improve">提示改进 <span id="filterImprove">0</span></button>
+                            <button class="filter-btn" data-status="confirm">需人工确认 <span id="filterConfirm">0</span></button>
+                            <button class="filter-btn" data-status="pass">通过 <span id="filterPass">0</span></button>
+                            <button class="filter-btn" data-status="na">不适用 <span id="filterNa">0</span></button>
+                        </div>
+                        <div class="search-export">
+                            <input type="text" id="searchInput" placeholder="搜编号、标题或原文">
+                            <button id="exportBtn" class="btn btn-primary btn-sm">导出审核意见</button>
+                        </div>
+                    </div>
+                    <div class="result-list" id="resultList"></div>
+                </div>
+            </section>
+
+            <section class="compare-panel card" id="comparePanel" style="display:none;">
+                <div class="panel-header">
+                    <h3>合同版本比对</h3>
+                    <button id="closeCompareBtn" class="btn btn-default btn-sm">关闭</button>
+                </div>
+                <div class="compare-uploads">
+                    <div class="compare-file">
+                        <label>合同版本 A</label>
+                        <button class="btn btn-default btn-sm" id="compareSelectA">选择文件</button>
+                        <span id="compareNameA" class="compare-filename">未选择</span>
+                    </div>
+                    <div class="compare-file">
+                        <label>合同版本 B</label>
+                        <button class="btn btn-default btn-sm" id="compareSelectB">选择文件</button>
+                        <span id="compareNameB" class="compare-filename">未选择</span>
+                    </div>
+                    <button id="runCompareBtn" class="btn btn-primary btn-sm">开始比对</button>
+                </div>
+                <div class="compare-result" id="compareResult"></div>
+            </section>
+
+            <section class="project-panel card" id="projectPanel" style="display:none;">
+                <div class="panel-header">
+                    <h3>项目管理</h3>
+                    <button id="closeProjectBtn" class="btn btn-default btn-sm">关闭</button>
+                </div>
+                <div class="project-toolbar">
+                    <input type="text" id="projectNameInput" placeholder="项目名称（默认使用文件夹名）">
+                    <button id="saveProjectBtn" class="btn btn-primary btn-sm">保存当前为项目</button>
+                    <button id="batchExportBtn" class="btn btn-default btn-sm">批量导出全部项目</button>
+                </div>
+                <div id="projectList" class="project-list"></div>
+            </section>
+
+            <section class="basis-panel card" id="basisPanel" style="display:none;">
+                <div class="panel-header">
+                    <h3>📚 文件依据库</h3>
+                    <button id="closeBasisBtn" class="btn btn-default btn-sm">关闭</button>
+                </div>
+                <div class="basis-toolbar">
+                    <p class="basis-desc">上传政策法规文件作为审核依据。支持 .docx、.doc、.pdf 格式。审核时会自动引用这些文件内容辅助判断。</p>
+                    <input type="file" id="basisFileInput" accept=".docx,.doc,.pdf" multiple style="display:none">
+                    <button id="addBasisBtn" class="btn btn-primary btn-sm"><span class="btn-icon">➕</span>上传依据文件</button>
+                </div>
+                <div id="basisList" class="basis-list"></div>
+            </section>
+
+            <section class="history-panel card" id="historyPanel" style="display:none;">
+                <div class="history-header">
+                    <h3>历史审核记录</h3>
+                    <button id="closeHistoryBtn" class="btn btn-default btn-sm">关闭</button>
+                </div>
+                <div id="historyList" class="history-list"></div>
+            </section>
+        </main>
+    </div>
+
+    <script src="js/auditRules.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>
