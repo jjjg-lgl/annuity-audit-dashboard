@@ -388,6 +388,103 @@ async function extractText(file) {
     return '';
 }
 
+/**
+ * 从文件文本中提取匹配关键词的上下文片段
+ * @param {string} fileText - 文件全文
+ * @param {string[]} keywords - 关键词列表
+ * @param {number} contextLen - 上下文长度（前后各N字符）
+ * @returns {Array} [{keyword, snippet, position}]
+ */
+function extractSnippets(fileText, keywords, contextLen = 40) {
+    if (!fileText || !keywords || !keywords.length) return [];
+    const snippets = [];
+    const seen = new Set(); // 去重：同一位置同一关键词只取一次
+    for (const kw of keywords) {
+        if (!kw || kw.length < 2) continue;
+        let idx = 0;
+        let count = 0;
+        const maxPerKw = 5; // 每个关键词最多取5处匹配
+        while (count < maxPerKw && idx < fileText.length) {
+            const pos = fileText.indexOf(kw, idx);
+            if (pos === -1) break;
+            const start = Math.max(0, pos - contextLen);
+            const end = Math.min(fileText.length, pos + kw.length + contextLen);
+            const snippet = fileText.slice(start, end).replace(/\s+/g, ' ').trim();
+            const key = pos + '|' + kw;
+            if (!seen.has(key)) {
+                seen.add(key);
+                snippets.push({ keyword: kw, snippet, position: pos, start, end });
+            }
+            idx = pos + kw.length;
+            count++;
+        }
+    }
+    // 按位置排序
+    snippets.sort((a, b) => a.position - b.position);
+    return snippets;
+}
+
+/**
+ * 为审核规则在所有已解析文件中定位原文片段
+ */
+function locateSourceInFiles(rule, fileMap) {
+    if (!fileMap || !Object.keys(fileMap).length) return [];
+    // 关键词优先级：1. 规则声明的 keywords 2. fact 中出现的引号内容 3. 规则标题
+    const kwSet = new Set();
+    (rule.keywords || []).forEach(k => kwSet.add(k));
+    // 从 fact 中提取被实际引号包围的内容作为补充关键词（引号必须成对出现）
+    const fact = rule._fact || '';
+    const quoted = [];
+    const quotePatterns = [
+        /"([^"]{2,30})"/g,
+        /'([^']{2,30})'/g,
+        /「([^」]{2,30})」/g,
+        /『([^』]{2,30})』/g,
+        /（([^）]{2,30})）/g,
+        /《([^》]{2,30})》/g
+    ];
+    for (const re of quotePatterns) {
+        let m;
+        while ((m = re.exec(fact)) !== null) {
+            quoted.push(m[1]);
+        }
+    }
+    quoted.forEach(q => {
+        const clean = q.trim();
+        if (clean && clean.length >= 2 && clean.length <= 20) kwSet.add(clean);
+    });
+    kwSet.add(rule.title);
+    const keywords = Array.from(kwSet).filter(k => k && k.length >= 2);
+
+    // 按文件优先级搜索（合同文件优先）
+    const entries = Object.entries(fileMap);
+    const contractEntries = entries.filter(([n]) => /合同|续签|期限|contract/i.test(n));
+    const otherEntries = entries.filter(([n]) => !/合同|续签|期限|contract/i.test(n));
+    const searchOrder = [...contractEntries, ...otherEntries];
+
+    const results = [];
+    for (const [fname, ftext] of searchOrder) {
+        const snips = extractSnippets(ftext, keywords, 50);
+        if (snips.length) {
+            results.push({ file: fname, snippets: snips, fullText: ftext });
+        }
+    }
+    // 如果合同文件中有匹配，优先只返回合同文件的结果（避免授权书/说明等干扰）
+    const contractResults = results.filter(r => /合同|续签|期限|contract/i.test(r.file));
+    if (contractResults.length > 0) {
+        return contractResults;
+    }
+    return results;
+}
+
+/**
+ * 清理 suggestion 中的状态标记前缀
+ */
+function cleanSuggestion(text) {
+    if (!text) return text;
+    return text.replace(/^【(fail|rectify|improve|pass)】/i, '').trim();
+}
+
 function runAudit(files, text, fileMap, basisText) {
     const allFileNames = files.map(f => f.name);
     return AUDIT_RULES.map(rule => {
@@ -396,15 +493,13 @@ function runAudit(files, text, fileMap, basisText) {
         let sourceFiles = res.sourceFiles || [];
         if (!sourceFiles.length && res.status !== 'pass' && res.status !== 'na') {
             if (rule.dim === 'A') {
-                // A组材料类：返回所有文件名（无法精确定位）
                 sourceFiles = allFileNames;
             } else {
-                // 其他组：根据规则关键词在 fileMap 中搜索匹配的文件
-                const keywords = [rule.title, ...rule.description.split(/[，。；]/)];
+                const keywords = (rule.keywords || []).concat([rule.title]);
                 const matched = new Set();
                 for (const [fname, ftext] of Object.entries(fileMap || {})) {
                     for (const kw of keywords) {
-                        if (kw.length > 2 && ftext && ftext.includes(kw)) {
+                        if (kw.length > 1 && ftext && ftext.includes(kw)) {
                             matched.add(fname);
                             break;
                         }
@@ -413,6 +508,8 @@ function runAudit(files, text, fileMap, basisText) {
                 sourceFiles = matched.size ? Array.from(matched) : allFileNames;
             }
         }
+        // 定位原文片段
+        const snippetData = locateSourceInFiles({ ...rule, _fact: res.fact }, fileMap);
         return {
             id: rule.id,
             dim: rule.dim,
@@ -422,8 +519,9 @@ function runAudit(files, text, fileMap, basisText) {
             status: res.status,
             fact: res.fact,
             basis: res.basis,
-            suggestion: res.suggestion,
-            sourceFiles
+            suggestion: cleanSuggestion(res.suggestion),
+            sourceFiles,
+            matchedSnippets: snippetData
         };
     });
 }
@@ -596,6 +694,42 @@ function renderBarChart() {
     });
 }
 
+/**
+ * 将原文片段中的关键词高亮标记
+ */
+function highlightKeyword(text, keyword) {
+    if (!text || !keyword) return text;
+    const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(escaped, 'g');
+    return text.replace(regex, `<mark class="hl-kw">${keyword}</mark>`);
+}
+
+/**
+ * 生成原文摘录的快捷预览（最多显示2条）
+ */
+function buildSnippetPreview(r) {
+    if (!r.matchedSnippets || !r.matchedSnippets.length) return '';
+    // 优先取非 pass 状态的匹配
+    const groups = r.matchedSnippets.slice(0, 2); // 最多显示2个文件组
+    const previews = [];
+    for (const g of groups) {
+        const topSnip = g.snippets.slice(0, 2); // 每个文件取前2条片段
+        for (const s of topSnip) {
+            const highlighted = highlightKeyword(escapeHtml(s.snippet), s.keyword);
+            previews.push(`
+                <div class="snippet-row">
+                    <span class="snippet-file">📄 ${escapeHtml(g.file)}</span>
+                    <span class="snippet-pos">位置 ≈ ${s.position}字</span>
+                    <div class="snippet-text">${highlighted}</div>
+                </div>
+            `);
+        }
+    }
+    const totalCount = r.matchedSnippets.reduce((sum, g) => sum + g.snippets.length, 0);
+    const moreHint = totalCount > 4 ? `<div class="snippet-more">…共 ${totalCount} 处匹配，点击「查看原文」查看全部</div>` : '';
+    return `<div class="snippet-preview">${previews.join('')}${moreHint}</div>`;
+}
+
 function renderResultList() {
     if (appState.activeTab === 'material') {
         renderMaterialList();
@@ -629,19 +763,32 @@ function renderResultList() {
         const fixBtn = showFix ? `<button class="fix-btn ${r.fixStatus==='done'?'fixed':''}" data-id="${r.id}">${r.fixStatus==='done'?'已整改':'标为已整改'}</button>` : '';
         const basisTooltip = getBasisTooltip(r.basis);
         const basisTip = basisTooltip ? `<span class="basis-tip" title="${escapeHtml(basisTooltip)}">ℹ️</span>` : '';
+        const MAX_FILES_SHOW = 5;
         const sourceFilesHtml = (r.sourceFiles && r.sourceFiles.length)
-            ? `<div class="result-files">📎 涉及文件：${r.sourceFiles.map(f => `<span class="file-tag">${escapeHtml(f)}</span>`).join('')}</div>`
+            ? (() => {
+                const files = r.sourceFiles;
+                const shown = files.slice(0, MAX_FILES_SHOW).map(f => `<span class="file-tag">${escapeHtml(f)}</span>`).join('');
+                const more = files.length > MAX_FILES_SHOW ? `<span class="file-tag file-tag-more">等${files.length - MAX_FILES_SHOW}个文件</span>` : '';
+                return `<div class="result-files">📎 涉及文件：${shown}${more}</div>`;
+            })()
             : '';
+        const snippetPreview = buildSnippetPreview(r);
+        const hasSnippets = r.matchedSnippets && r.matchedSnippets.some(g => g.snippets.length > 0);
+        const viewSrcBtn = hasSnippets
+            ? `<button class="action-btn view-src-btn" data-id="${r.id}">🔍 查看原文(${r.matchedSnippets.reduce((s,g)=>s+g.snippets.length,0)})</button>`
+            : `<button class="action-btn view-src-btn disabled" title="未在已解析材料中定位到匹配原文">🔍 查看原文</button>`;
         return `
         <div class="result-item">
             <div class="result-id">${r.id}</div>
             <div class="result-body">
                 <div class="result-title">${r.title}</div>
                 <div class="result-fact">${r.fact}</div>
+                ${snippetPreview}
                 <div class="result-basis">${r.basis}${basisTip}</div>
                 <div class="result-suggest">${r.suggestion}</div>
                 ${sourceFilesHtml}
                 <div class="result-actions">
+                    ${viewSrcBtn}
                     <span class="action-label">系统初判：${STATUS_LABELS[r.status]}</span>
                     ${manualTag}
                     <span class="action-label">人工判定：</span>
@@ -658,12 +805,16 @@ function renderResultList() {
     `}).join('');
 
     // 绑定人工判定事件
-    document.querySelectorAll('.action-btn').forEach(btn => {
+    document.querySelectorAll('.action-btn[data-status]').forEach(btn => {
         btn.addEventListener('click', (e) => setManualStatus(e.target.dataset.id, e.target.dataset.status));
     });
     // 绑定整改事件
     document.querySelectorAll('.fix-btn').forEach(btn => {
         btn.addEventListener('click', (e) => toggleFixStatus(e.target.dataset.id));
+    });
+    // 绑定查看原文事件
+    document.querySelectorAll('.view-src-btn:not(.disabled)').forEach(btn => {
+        btn.addEventListener('click', (e) => openSourceModal(e.target.dataset.id));
     });
 }
 
@@ -790,23 +941,41 @@ function renderMaterialList() {
 
 function exportResults() {
     if (!appState.results.length) return showToast('请先导入合同材料后再导出审核意见', { type: 'warning' });
+    exportResultsFromData(appState.results, appState.folderName || '未命名');
+}
 
-    const rows = appState.results.map(r => ({
+function buildSnippetsForExport(r) {
+    if (!r.matchedSnippets || !r.matchedSnippets.length) return '';
+    const lines = [];
+    for (const g of r.matchedSnippets) {
+        for (const s of g.snippets.slice(0, 3)) {
+            lines.push(`【${g.file}·${s.keyword}】${s.snippet}`);
+        }
+    }
+    return lines.slice(0, 3).join('\n');
+}
+
+function exportResultsFromData(results, name) {
+    const rows = results.map(r => ({
         '编号': r.id,
         '维度': `${r.dim} ${AUDIT_DIMENSIONS.find(d => d.code === r.dim)?.name || ''}`,
         '审核要点': r.title,
         '风险等级': r.level,
-        '审核结论': STATUS_LABELS[getEffectiveStatus(r)],
+        '审核结论': STATUS_LABELS[r.manualStatus || r.status],
+        '原文摘录（位置）': buildSnippetsForExport(r),
         '原文/事实': r.fact,
         '依据': r.basis,
         '审核意见/建议': r.suggestion
     }));
-
     const ws = XLSX.utils.json_to_sheet(rows);
+    // 设置列宽
+    ws['!cols'] = [
+        { wch: 8 }, { wch: 20 }, { wch: 16 }, { wch: 8 }, { wch: 12 },
+        { wch: 50 }, { wch: 40 }, { wch: 30 }, { wch: 50 }
+    ];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, '审核结果');
-
-    const fileName = `年金合同备案审核意见_${appState.folderName || '未命名'}_${new Date().toISOString().slice(0, 10)}.xlsx`;
+    const fileName = `年金合同备案审核意见_${name || '未命名'}_${new Date().toISOString().slice(0, 10)}.xlsx`;
     XLSX.writeFile(wb, fileName);
 }
 
@@ -1498,6 +1667,17 @@ function saveProject() {
     if (!appState.results.length) return showToast('当前无审核数据，请先导入合同材料', { type: 'warning' });
     const name = els.projectNameInput.value.trim() || appState.folderName || '未命名项目';
     const projects = getProjects();
+    // 保存前剔除 matchedSnippets 中的 fullText，避免 localStorage 超出配额
+    const resultsToSave = appState.results.map(r => {
+        if (!r.matchedSnippets) return r;
+        return {
+            ...r,
+            matchedSnippets: r.matchedSnippets.map(g => ({
+                file: g.file,
+                snippets: g.snippets
+            }))
+        };
+    });
     const project = {
         id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
         name,
@@ -1505,15 +1685,20 @@ function saveProject() {
         importTime: appState.importTime,
         fileCount: appState.files.length,
         files: appState.files.map(f => ({ name: f.name, size: f.size, type: f.type })),
-        results: appState.results,
+        results: resultsToSave,
         combinedText: appState.combinedText
     };
     projects.unshift(project);
     if (projects.length > 100) projects.length = 100;
-    localStorage.setItem('annuityAuditProjects', JSON.stringify(projects));
-    els.projectNameInput.value = '';
-    renderProjectList();
-    showToast(`项目「${name}」已保存，您可以在「项目管理」中查看和导出。`, { type: 'success', title: '项目保存成功' });
+    try {
+        localStorage.setItem('annuityAuditProjects', JSON.stringify(projects));
+        els.projectNameInput.value = '';
+        renderProjectList();
+        showToast(`项目「${name}」已保存，您可以在「项目管理」中查看和导出。`, { type: 'success', title: '项目保存成功' });
+    } catch (e) {
+        console.error('保存项目失败:', e);
+        showToast('保存失败：数据量过大，超出浏览器存储限制。建议导出 Excel 备份。', { type: 'error', title: '保存失败' });
+    }
 }
 
 function renderProjectList() {
@@ -1600,24 +1785,6 @@ function exportProject(id) {
     exportResultsFromData(p.results, p.name);
 }
 
-function exportResultsFromData(results, name) {
-    const rows = results.map(r => ({
-        '编号': r.id,
-        '维度': `${r.dim} ${AUDIT_DIMENSIONS.find(d => d.code === r.dim)?.name || ''}`,
-        '审核要点': r.title,
-        '风险等级': r.level,
-        '审核结论': STATUS_LABELS[r.manualStatus || r.status],
-        '原文/事实': r.fact,
-        '依据': r.basis,
-        '审核意见/建议': r.suggestion
-    }));
-    const ws = XLSX.utils.json_to_sheet(rows);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, '审核结果');
-    const fileName = `年金合同备案审核意见_${name || '未命名'}_${new Date().toISOString().slice(0, 10)}.xlsx`;
-    XLSX.writeFile(wb, fileName);
-}
-
 function batchExportProjects() {
     const projects = getProjects();
     if (!projects.length) return showToast('暂无保存的项目，请先导入数据并保存项目', { type: 'warning' });
@@ -1630,6 +1797,7 @@ function batchExportProjects() {
             '审核要点': r.title,
             '风险等级': r.level,
             '审核结论': STATUS_LABELS[r.manualStatus || r.status],
+            '原文摘录（位置）': buildSnippetsForExport(r),
             '原文/事实': r.fact,
             '依据': r.basis,
             '审核意见/建议': r.suggestion
@@ -1644,15 +1812,16 @@ function batchExportProjects() {
 
 /* ==================== 功能7: 法律依据快捷参考 ==================== */
 const BASIS_DETAILS = {
-    '赣人社字〔2016〕7号': '《江西省人力资源和社会保障厅关于企业年金基金管理合同备案有关问题的通知》：明确备案材料清单、格式及审核要点。',
+    '赣人社字〔2016〕7号': '《江西省人力资源和社会保障厅关于进一步规范企业年金基金管理合同备案及企业年金数据统计等有关问题的通知》（赣人社字〔2016〕7号）：一、规范企业年金基金管理合同报备——（一）合同报备时间：签订之日起10日内由受托人报省人社厅备案；变更的，自变化发生之日起15日内重新备案。（二）合同报备资料：1.年金方案及人社部门备案复函；2.备案申请函（按建立/顺延续签/加入退出集合/管理人变更等情形，格式参阅人社监司函〔2013〕18号）；3.受托管理合同及委托管理合同正本（含按审核意见签订的补充协议正本）、双方盖章的合同条款差异说明、合同正文Word版及签章页扫描件；4.备案情况登记表（附件1）；5.理事会模式需附理事会章程、组成人员名单及简历；6.法人受托/账户/托管/投管资格证书及授权文件（2016年1月20日前提供电子扫描版）。二、数据统计：半年报7月20日前、年报次年1月20日前报送。三、信息采集：年度结束后60个工作日内提交受托管理业务报告；集合计划加入/退出情况简表每月末报送。',
     '人社监司函〔2013〕18号': '《人力资源社会保障部社会保险基金监督司关于企业年金计划备案有关问题的函》：规范备案申请函格式与内容。',
     '51号文': '《关于进一步加强企业年金基金管理的通知》（2025-09-12）：合同期限≥3年、业绩基准须在合同正文、不得用补充协议实质变更合同等硬性要求。',
-    '赣人社发〔2018〕37号': '《江西省职业年金基金管理实施办法》：规范职业年金合同签署、报送时限及确认函出具要求。',
+    '赣人社发〔2018〕37号': '《江西省职业年金基金管理实施办法（试行）》：规定每个计划设1名受托人、1名托管人，不少于3名投资管理人；同一计划中受托人与托管人、托管人与投资管理人不得为同一机构，相关人员不得相互兼任（第十六条）；实账基金市场化投资运营，多个计划投资收益实行统一收益率（第十七条）；首期待遇资金由各计划平均承担（第二十条）；职业年金合同由代理人代理委托人与受托人签订，合同期限3-5年，受托人自签署之日起15个工作日内报送备案，人社部门收到材料后15个工作日内出具确认函（第二十一条）。',
     '11号令': '《企业年金基金管理办法》（人社部令第11号）：规定管理人资格条件、职责及合同管理要求。',
     '35号文': '《关于规范企业年金基金管理有关问题的通知》：严禁保底收益、利益输送，要求费率等关键条款须在合同正文约定。',
     '口径说明一': '省人社厅内部口径说明：明确51号文后合同期限不足3年不予备案，且不得以临时短期延长方式充数。',
     '培训材料': '省人社厅备案审核培训材料：涵盖业绩基准、费率结构、考核淘汰等实务审核要点。',
-    '会议纪要': '相关会议纪要：对过渡安排、特殊情形、补充协议定位等问题形成的一致性意见。'
+    '会议纪要': '相关会议纪要：对过渡安排、特殊情形、补充协议定位等问题形成的一致性意见。',
+    '92号文': '《职业年金基金管理暂行办法》（人社部发〔2016〕92号）：规定受托人、托管人、投资管理人须在具有相应企业年金基金管理资格的机构中选择（第三条）；同一职业年金计划中受托人与托管人、托管人与投资管理人不得为同一机构，高级管理人员和从业人员不得相互兼任，受托人兼任投资管理人时应确保业务独立性（第七条）；投资管理人从当期管理费中提取20%作为风险准备金，余额达到所管理投资组合基金资产净值的10%时可不再提取（第三十五条）；职业年金计划变更时受托人应将合同重新报人力资源社会保障行政部门备案，原计划登记号不变（第三十六条）；职业年金计划终止时由代理人与受托人共同组织清算组，自终止后3个月内完成清算并提交经审计及法律意见的清算报告，人社部门接到报告后注销该计划（第三十七条）；代理人代理委托人与受托人签订合同，受托人报人社部门备案，收到符合规定材料后15个工作日内出具确认函（第五条）；一个计划应当只有一个受托人、一个托管人，可根据资产规模选择适量投资管理人（第四条）。'
 };
 
 function getBasisTooltip(basisText) {
@@ -1661,6 +1830,153 @@ function getBasisTooltip(basisText) {
         if (basisText.includes(key)) return BASIS_DETAILS[key];
     }
     return '';
+}
+
+/* ==================== 原文查看弹窗 ==================== */
+let sourceModal = null;
+
+function openSourceModal(resultId) {
+    const r = appState.results.find(x => x.id === resultId);
+    if (!r || !r.matchedSnippets || !r.matchedSnippets.length) return;
+
+    // 创建弹窗
+    if (!sourceModal) {
+        sourceModal = document.createElement('div');
+        sourceModal.className = 'source-modal-overlay';
+        sourceModal.innerHTML = `
+            <div class="source-modal">
+                <div class="source-modal-header">
+                    <div class="source-modal-title">
+                        <span id="smId"></span>
+                        <span id="smTitle"></span>
+                    </div>
+                    <button class="source-modal-close">✕</button>
+                </div>
+                <div class="source-modal-body">
+                    <div class="source-tabs" id="smTabs"></div>
+                    <div class="source-content" id="smContent"></div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(sourceModal);
+        sourceModal.querySelector('.source-modal-close').addEventListener('click', closeSourceModal);
+        sourceModal.addEventListener('click', (e) => { if (e.target === sourceModal) closeSourceModal(); });
+        document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSourceModal(); });
+    }
+
+    // 填充标题
+    sourceModal.querySelector('#smId').textContent = r.id;
+    sourceModal.querySelector('#smTitle').textContent = r.title;
+
+    // 构建文件分组标签页
+    const groups = r.matchedSnippets.filter(g => g.snippets.length > 0);
+    const tabs = sourceModal.querySelector('#smTabs');
+    const content = sourceModal.querySelector('#smContent');
+    tabs.innerHTML = groups.map((g, idx) =>
+        `<button class="source-tab ${idx === 0 ? 'active' : ''}" data-idx="${idx}">📄 ${escapeHtml(g.file)} <span class="tab-count">${g.snippets.length}</span></button>`
+    ).join('');
+
+    // 渲染第一个文件的内容
+    renderSourceFileContent(content, groups[0], r.keywords || []);
+
+    // 绑定标签切换
+    tabs.querySelectorAll('.source-tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+            tabs.querySelectorAll('.source-tab').forEach(t => t.classList.remove('active'));
+            tab.classList.add('active');
+            const idx = parseInt(tab.dataset.idx);
+            renderSourceFileContent(content, groups[idx], r.keywords || []);
+        });
+    });
+
+    sourceModal.style.display = 'flex';
+}
+
+function closeSourceModal() {
+    if (sourceModal) sourceModal.style.display = 'none';
+}
+
+function renderSourceFileContent(container, group, ruleKeywords) {
+    if (!group) { container.innerHTML = '<div class="loading">无匹配原文</div>'; return; }
+    const keywords = [...new Set([...(ruleKeywords || []), ...group.snippets.map(s => s.keyword)])];
+    // 左侧：匹配片段列表
+    const snippetList = group.snippets.map((s, idx) => `
+        <div class="sm-snippet-item" data-idx="${idx}">
+            <div class="sm-snippet-kw">关键词：<mark class="hl-kw">${escapeHtml(s.keyword)}</mark> · 位置 ≈ ${s.position}字</div>
+            <div class="sm-snippet-text">${highlightKeyword(escapeHtml(s.snippet), s.keyword)}</div>
+        </div>
+    `).join('');
+
+    // 右侧：全文视图（滚动到匹配位置）
+    let fullText = group.fullText || '';
+    // fallback：如果 fullText 为空，从 appState.fileMap 重新获取
+    if (!fullText && appState.fileMap && appState.fileMap[group.file]) {
+        fullText = appState.fileMap[group.file];
+    }
+    // fallback2：如果仍然为空，用片段拼接
+    if (!fullText && group.snippets && group.snippets.length) {
+        fullText = group.snippets.map(s => s.snippet).join('\n\n……\n\n');
+    }
+    if (!fullText) {
+        fullText = '（未能加载该文件全文，仅显示左侧匹配片段）';
+    }
+    // 先把全文中的所有关键词都高亮
+    let highlightedFull = escapeHtml(fullText);
+    for (const kw of keywords) {
+        if (!kw || kw.length < 2) continue;
+        highlightedFull = highlightKeyword(highlightedFull, kw);
+    }
+
+    container.innerHTML = `
+        <div class="sm-layout">
+            <div class="sm-left">
+                <div class="sm-left-title">📌 匹配到的原文片段（${group.snippets.length}处）</div>
+                <div class="sm-snippet-list">${snippetList}</div>
+            </div>
+            <div class="sm-right">
+                <div class="sm-right-title">📖 文件全文（关键词已高亮，点击左侧片段可定位）</div>
+                <div class="sm-fulltext" id="smFulltext">${highlightedFull}</div>
+            </div>
+        </div>
+    `;
+
+    // 绑定片段点击 → 定位到全文位置
+    const fulltextEl = container.querySelector('#smFulltext');
+    container.querySelectorAll('.sm-snippet-item').forEach(item => {
+        item.addEventListener('click', () => {
+            const idx = parseInt(item.dataset.idx);
+            const snip = group.snippets[idx];
+            if (fulltextEl && snip) {
+                // 在右侧全文中查找该关键词对应的 mark 元素
+                const marks = fulltextEl.querySelectorAll('mark.hl-kw');
+                let found = false;
+                for (const mark of marks) {
+                    if (mark.textContent === snip.keyword) {
+                        mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        mark.classList.add('flash-highlight');
+                        setTimeout(() => mark.classList.remove('flash-highlight'), 2000);
+                        found = true;
+                        break;
+                    }
+                }
+                // 视觉反馈
+                item.classList.add('active');
+                setTimeout(() => item.classList.remove('active'), 800);
+                if (!found) {
+                    // 如果精确匹配失败，尝试部分匹配
+                    for (const mark of marks) {
+                        if (mark.textContent.includes(snip.keyword) || snip.keyword.includes(mark.textContent)) {
+                            mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            mark.classList.add('flash-highlight');
+                            setTimeout(() => mark.classList.remove('flash-highlight'), 2000);
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    });
 }
 
 init();
